@@ -38,6 +38,7 @@ pub enum Binop {
     WideningMul(Signedness),
     Div(Signedness),
     Mod(Signedness),
+
     Or,
     And,
     Xor,
@@ -50,16 +51,45 @@ pub enum Binop {
     CmpLe(Signedness),
     CmpGt(Signedness),
     CmpGe(Signedness),
-    Clz,
-    Ctz,
     Max(Signedness),
 
     Unsupported(u32),
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Unop {
+    Not,
+    Neg,
+    Clz,
+    Ctz,
+    F32to64,
+    FNeg,
+    FAbs,
+}
+
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RoundedUnop {
+    F64to32,
+    FSqrt,
+
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RoundedBinop {
+    // these add rounding
+    FAdd,
+    FSub,
+    FMul,
+    FDiv,
+
+}
+
 pub enum Expr<Ref> {
     Bin(Binop, Ref, Ref),
     Un(Unop, Ref),
+    RoundedUn(RoundedUnop, Ref, Ref),
+    RoundedBin(RoundedBinop, Ref, Ref, Ref),
     ITE(Ref, Ref, Ref),
     Ext(Signedness, Ty, Ref),
     Trunc(Ty, Ref),
@@ -128,17 +158,34 @@ fn guess_type<Ref: RefTy>(ex: Expr<Ref>) -> Ty {
             match op {
                 Binop::WideningMul(_) => lty.double_int().unwrap(),
                 Binop::CmpEq | Binop::CmpNe | Binop::CmpLt(_) |
-                Binop::CmpLe(_) | Binop::CmpGt(_) | Binop::CmpGe(_) =>
-                    I1,
+                Binop::CmpLe(_) | Binop::CmpGt(_) | Binop::CmpGe(_) => I1,
                 _ => lty
             }
         },
         &Expr::Un(op, ref arg) => {
             let ty = arg.ty;
             match op {
+                Unop::Clz | Unop::Ctz => I32,
+                Unop::F32to64 => F64,
                 _ => ty
             }
         },
+        &Expr::RoundedUn(op, ref rm, ref arg) => {
+            assert_eq!(rm.ty, I32); // rounding mode
+            let ty = arg.ty;
+            match op {
+                RoundedUnop::F64to32 => { assert_eq!(ty, F64); F32 },
+                RoundedUnop::FSqrt => ty,
+            }
+        }
+        &Expr::RoundedBin(op, ref rm, ref l, ref r) => {
+            assert_eq!(rm.ty, I32); // rounding mode
+            assert_eq!(l.ty, r.ty);
+            let ty = r.ty;
+            match op {
+                _ => ty
+            }
+        }
         &Expr::ITE(ref iff, ref then, ref els) => {
             assert_eq!(iff.ty, I1);
             assert_eq!(then.ty, els.ty);
@@ -181,6 +228,17 @@ trait Builder {
     fn un(&self, op: Unop, arg: Self::Ref) -> Self::Ref {
         self.build(Expr::Un(op, arg))
     }
+    fn rbin(&self, op: RoundedBinop, rm: Self::Ref, l: Self::Ref, r: Self::Ref) -> Self::Ref {
+        self.build(Expr::RoundedBin(op, rm, l, r))
+    }
+    fn run(&self, op: RoundedUnop, rm: Self::Ref, x: Self::Ref) -> Self::Ref {
+        self.build(Expr::RoundedUn(op, rm, x))
+    }
+    /*
+    fn tri(&self, op: Triop, x: Self::Ref, y: Self::Ref, z: Self::Ref) -> Self::Ref {
+        self.build(Expr::Tri(op, x, y, z))
+    }
+    */
     fn ite(&self, iff: Self::Ref, then: Self::Ref, els: Self::Ref) -> Self::Ref {
         self.build(Expr::ITE(iff, then, els))
     }
@@ -201,12 +259,6 @@ trait Builder {
     fn const_int<N: Into<U128>>(&self, ty: Ty, num: N) -> Self::Ref {
         self.build(Expr::ConstInt(ty, num.into()))
     }
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Unop {
-    Not,
-    Neg,
 }
 
 fn pair<B: Builder>(b: &B, hi: B::Ref, lo: B::Ref) -> B::Ref {
@@ -285,7 +337,10 @@ fn make_binex<B: Builder>(b: &B, op: u32, l: B::Ref, r: B::Ref) -> B::Ref {
             pair(b, b.bin(Binop::Mod(s), l.clone(), r.clone()),
                     b.bin(Binop::Div(s), l.clone(), r.clone()))
         },
-        Iop_16HLto32 | Iop_32HLto64 | Iop_64HLto128 =>  pair(b, l, r),
+        Iop_16HLto32 | Iop_32HLto64 | Iop_64HLto128 => pair(b, l, r),
+
+        Iop_SqrtF64 | Iop_SqrtF32 => b.run(RoundedUnop::FSqrt, l, r),
+
         _ => b.bin(translate_binop(op), l, r),
     }
 }
@@ -311,9 +366,6 @@ fn translate_binop(x: u32) -> Binop {
         Iop_MullS8 | Iop_MullS16 | Iop_MullS32 | Iop_MullS64 => Binop::WideningMul(Signed),
         Iop_MullU8 | Iop_MullU16 | Iop_MullU32 | Iop_MullU64 => Binop::WideningMul(Unsigned),
 
-        Iop_Clz64 | Iop_Clz32 => Binop::Clz,
-        Iop_Ctz64 | Iop_Ctz32 => Binop::Ctz,
-
         Iop_CmpLT32S | Iop_CmpLT64S => Binop::CmpLt(Signed),
         Iop_CmpLE32S | Iop_CmpLE64S => Binop::CmpLe(Signed),
         Iop_CmpLT32U | Iop_CmpLT64U => Binop::CmpLt(Unsigned),
@@ -331,7 +383,39 @@ fn translate_binop(x: u32) -> Binop {
 fn translate_unop(x: u32) -> Unop {
     match x {
         Iop_Not1 | Iop_Not8 | Iop_Not16 | Iop_Not32 | Iop_Not64 => Unop::Not,
+        Iop_Clz64 | Iop_Clz32 => Unop::Clz,
+        Iop_Ctz64 | Iop_Ctz32 => Unop::Ctz,
+        Iop_NegF64 | Iop_NegF32 => Unop::FNeg,
+        Iop_AbsF64 | Iop_AbsF32 => Unop::FAbs,
+
         _ => panic!("unexpected unop {}", x),
+    }
+}
+
+fn make_triex<B: Builder>(b: &B, op: u32, x: B::Ref, y: B::Ref, z: B::Ref) -> B::Ref {
+    let roundabout = |bop: RoundedBinop, rm: B::Ref, l: B::Ref, r: B::Ref| {
+        b.un(Unop::F32to64, b.rbin(bop, rm.clone(),
+                                   b.run(RoundedUnop::F64to32, rm.clone(), l),
+                                   b.run(RoundedUnop::F64to32, rm.clone(), r)))
+
+    };
+    match op {
+        Iop_AddF64r32 => roundabout(RoundedBinop::FAdd, x, y, z),
+        Iop_SubF64r32 => roundabout(RoundedBinop::FSub, x, y, z),
+        Iop_MulF64r32 => roundabout(RoundedBinop::FMul, x, y, z),
+        Iop_DivF64r32 => roundabout(RoundedBinop::FDiv, x, y, z),
+
+        _ => b.rbin(translate_rbinop(op), x, y, z),
+    }
+}
+
+fn translate_rbinop(x: u32) -> RoundedBinop {
+    match x {
+        Iop_AddF64 | Iop_AddF32 => RoundedBinop::FAdd,
+        Iop_SubF64 | Iop_SubF32 => RoundedBinop::FSub,
+        Iop_MulF64 | Iop_MulF32 => RoundedBinop::FMul,
+        Iop_DivF64 | Iop_DivF32 => RoundedBinop::FDiv,
+        _ => panic!("unexpected triop {}", x),
     }
 }
 
