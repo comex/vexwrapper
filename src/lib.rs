@@ -4,7 +4,6 @@ extern crate libvex_sys;
 //use libvex_sys::IcoConsts::*;
 //use libvex_sys::IexConsts::*;
 use libvex_sys::IopConsts::*;
-use std::ops::Deref;
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Signedness {
     Signed,
@@ -143,9 +142,11 @@ impl Ty {
     }
 }
 
-fn guess_type<Ref: RefTy>(ex: Expr<Ref>) -> Ty {
+fn guess_type<B: Builder>(b: &B, ex: Expr<B::Ref>) -> Ty {
     match &ex {
         &Expr::Bin(op, ref left, ref right) => {
+            let left = b.get(left);
+            let right = b.get(right);
             let lty = left.ty;
             let rty = right.ty;
             match op {
@@ -163,6 +164,7 @@ fn guess_type<Ref: RefTy>(ex: Expr<Ref>) -> Ty {
             }
         },
         &Expr::Un(op, ref arg) => {
+            let arg = b.get(arg);
             let ty = arg.ty;
             match op {
                 Unop::Clz | Unop::Ctz => I32,
@@ -171,6 +173,8 @@ fn guess_type<Ref: RefTy>(ex: Expr<Ref>) -> Ty {
             }
         },
         &Expr::RoundedUn(op, ref rm, ref arg) => {
+            let rm = b.get(rm);
+            let arg = b.get(arg);
             assert_eq!(rm.ty, I32); // rounding mode
             let ty = arg.ty;
             match op {
@@ -179,6 +183,9 @@ fn guess_type<Ref: RefTy>(ex: Expr<Ref>) -> Ty {
             }
         }
         &Expr::RoundedBin(op, ref rm, ref l, ref r) => {
+            let rm = b.get(rm);
+            let l = b.get(l);
+            let r = b.get(r);
             assert_eq!(rm.ty, I32); // rounding mode
             assert_eq!(l.ty, r.ty);
             let ty = r.ty;
@@ -187,16 +194,19 @@ fn guess_type<Ref: RefTy>(ex: Expr<Ref>) -> Ty {
             }
         }
         &Expr::ITE(ref iff, ref then, ref els) => {
+            let iff = b.get(iff);
+            let then = b.get(then);
+            let els = b.get(els);
             assert_eq!(iff.ty, I1);
             assert_eq!(then.ty, els.ty);
             then.ty
         },
         &Expr::Ext(_, ty, ref x) => {
-            assert!(x.ty.max_int_val().unwrap() > ty.max_int_val().unwrap());
+            assert!(b.get(x).ty.max_int_val().unwrap() > ty.max_int_val().unwrap());
             ty
         },
         &Expr::Trunc(ty, ref x) => {
-            assert!(x.ty.max_int_val().unwrap() < ty.max_int_val().unwrap());
+            assert!(b.get(x).ty.max_int_val().unwrap() < ty.max_int_val().unwrap());
             ty
         },
         &Expr::ConstInt(ty, num) => {
@@ -206,19 +216,22 @@ fn guess_type<Ref: RefTy>(ex: Expr<Ref>) -> Ty {
     }
 }
 
-trait RefTy : Clone + Deref<Target=TExpr<Self>> {}
+trait RefTy : Clone {}
 
 trait Builder {
     type Ref: RefTy;
+    fn get(&self, r: &Self::Ref) -> &TExpr<Self::Ref>;
     fn build(&self, Expr<Self::Ref>) -> Self::Ref;
     fn bin(&self, op: Binop, left: Self::Ref, right: Self::Ref) -> Self::Ref {
+        let xleft = self.get(&left);
+        let xright = self.get(&right);
         match op {
             Binop::Add | Binop::Or | Binop::Xor => {
-                if left.ex.is_const_zero() { return right; }
-                if right.ex.is_const_zero() { return left; }
+                if xleft.ex.is_const_zero() { return right; }
+                if xright.ex.is_const_zero() { return left; }
             },
             Binop::Sub => {
-                if right.ex.is_const_zero() { return left; }
+                if xright.ex.is_const_zero() { return left; }
             },
             _ => ()
         }
@@ -243,14 +256,14 @@ trait Builder {
         self.build(Expr::ITE(iff, then, els))
     }
     fn ext(&self, s: Signedness, ty: Ty, x: Self::Ref) -> Self::Ref {
-        if ty == x.ty {
+        if ty == self.get(&x).ty {
             x
         } else {
             self.build(Expr::Ext(s, ty, x))
         }
     }
     fn trunc(&self, ty: Ty, x: Self::Ref) -> Self::Ref {
-        if ty == x.ty {
+        if ty == self.get(&x).ty {
             x
         } else {
             self.build(Expr::Trunc(ty, x))
@@ -262,15 +275,17 @@ trait Builder {
 }
 
 fn pair<B: Builder>(b: &B, hi: B::Ref, lo: B::Ref) -> B::Ref {
-    assert_eq!(hi.ty, lo.ty);
-    let big = hi.ty.double_int().unwrap();
+    let hty = b.get(&hi).ty;
+    let lty = b.get(&lo).ty;
+    assert_eq!(hty, lty);
+    let big = hty.double_int().unwrap();
     b.bin(Binop::Or, b.bin(Binop::Shl, b.ext(Unsigned, big, hi), b.const_int(I32, 32)),
                      b.ext(Unsigned, big, lo))
 
 }
 
 fn make_unex<B: Builder>(b: B, op: u32, x: B::Ref) -> B::Ref {
-    let ty = x.ty;
+    let ty = b.get(&x).ty;
     match op {
         Iop_Left8 | Iop_Left16 | Iop_Left32 | Iop_Left64 =>
             b.bin(Binop::Or, x.clone(), b.un(Unop::Neg, x.clone())),
@@ -310,7 +325,7 @@ fn make_unex<B: Builder>(b: B, op: u32, x: B::Ref) -> B::Ref {
 
 fn make_binex<B: Builder>(b: &B, op: u32, l: B::Ref, r: B::Ref) -> B::Ref {
     let cmp_ord = |l: B::Ref, r: B::Ref, sign: Signedness| {
-        let ty = l.ty;
+        let ty = b.get(&l).ty;
         b.ite(b.bin(Binop::CmpLt(sign), l.clone(), r.clone()),
               b.const_int(ty, 8),
               b.ite(b.bin(Binop::CmpGt(sign), l.clone(), r.clone()),
@@ -322,7 +337,7 @@ fn make_binex<B: Builder>(b: &B, op: u32, l: B::Ref, r: B::Ref) -> B::Ref {
         Iop_CmpORD32S | Iop_CmpORD64S => cmp_ord(l, r, Signed),
         Iop_DivU32E | Iop_DivS32E |
         Iop_DivU64E | Iop_DivS64E => {
-            let big = l.ty.double_int().unwrap();
+            let big = b.get(&l).ty.double_int().unwrap();
             b.bin(Binop::Div(signed_if(op == Iop_DivS32E || op == Iop_DivS64E)),
                   b.bin(Binop::Shl, b.ext(Unsigned, big, l), b.const_int(I32, 32)),
                   b.ext(Unsigned, big, r))
@@ -333,7 +348,7 @@ fn make_binex<B: Builder>(b: &B, op: u32, l: B::Ref, r: B::Ref) -> B::Ref {
             let s = signed_if(op == Iop_DivModS64to32 ||
                               op == Iop_DivModS64to64 ||
                               op == Iop_DivModS128to64);
-            let r = b.ext(s, l.ty, r);
+            let r = b.ext(s, b.get(&l).ty, r);
             pair(b, b.bin(Binop::Mod(s), l.clone(), r.clone()),
                     b.bin(Binop::Div(s), l.clone(), r.clone()))
         },
