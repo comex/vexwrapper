@@ -52,6 +52,8 @@ pub enum Binop {
     CmpGe(Signedness),
     Max(Signedness),
 
+    FCmp,
+
     Unsupported(u32),
 }
 
@@ -64,6 +66,7 @@ pub enum Unop {
     F32to64,
     FNeg,
     FAbs,
+    Bitcast(Ty),
 }
 
 
@@ -71,6 +74,8 @@ pub enum Unop {
 pub enum RoundedUnop {
     F64to32,
     FSqrt,
+    FToI(Signedness, Ty),
+    IToF(Signedness, Ty),
 
 }
 
@@ -116,10 +121,39 @@ pub enum Ty {
     I128,
     F32,
     F64,
+    F128,
 }
 pub use Ty::*;
 
 impl Ty {
+    fn is_int(self) -> bool {
+        match self {
+            I1 | I8 | I16 | I32 | I64 | I128 => true,
+            _ => false
+        }
+    }
+    fn is_float(self) -> bool {
+        match self {
+            F32 | F64 | F128 => true,
+            _ => false
+        }
+    }
+    fn same_size_i2f(self) -> Option<Ty> {
+        match self {
+            I32 =>  Some(F32),
+            I64 =>  Some(F64),
+            I128 => Some(F128),
+            _ => None,
+        }
+    }
+    fn same_size_f2i(self) -> Option<Ty> {
+        match self {
+            F32 =>  Some(I32),
+            F64 =>  Some(I64),
+            F128 => Some(I128),
+            _ => None,
+        }
+    }
     fn max_int_val(self) -> Option<U128> {
         match self {
             I1 =>  Some(1.into()),
@@ -151,7 +185,7 @@ fn guess_type<B: Builder>(b: &B, ex: Expr<B::Ref>) -> Ty {
             let rty = right.ty;
             match op {
                 Binop::Shl | Binop::Shr | Binop::Sar => {
-                    assert!(rty.max_int_val().is_some());
+                    assert!(rty.is_int());
                     return lty;
                 },
                 _ => assert_eq!(lty, rty),
@@ -160,6 +194,7 @@ fn guess_type<B: Builder>(b: &B, ex: Expr<B::Ref>) -> Ty {
                 Binop::WideningMul(_) => lty.double_int().unwrap(),
                 Binop::CmpEq | Binop::CmpNe | Binop::CmpLt(_) |
                 Binop::CmpLe(_) | Binop::CmpGt(_) | Binop::CmpGe(_) => I1,
+                Binop::FCmp => I32,
                 _ => lty
             }
         },
@@ -180,6 +215,14 @@ fn guess_type<B: Builder>(b: &B, ex: Expr<B::Ref>) -> Ty {
             match op {
                 RoundedUnop::F64to32 => { assert_eq!(ty, F64); F32 },
                 RoundedUnop::FSqrt => ty,
+                RoundedUnop::FToI(_, toty) => {
+                    assert!(toty.is_int());
+                    toty
+                },
+                RoundedUnop::IToF(_, toty) => {
+                    assert!(toty.is_float());
+                    toty
+                },
             }
         }
         &Expr::RoundedBin(op, ref rm, ref l, ref r) => {
@@ -274,14 +317,24 @@ trait Builder {
     }
 }
 
-fn pair<B: Builder>(b: &B, hi: B::Ref, lo: B::Ref) -> B::Ref {
-    let hty = b.get(&hi).ty;
+fn pair<B: Builder>(b: &B, mut hi: B::Ref, mut lo: B::Ref) -> B::Ref {
+    let mut hty = b.get(&hi).ty;
     let lty = b.get(&lo).ty;
     assert_eq!(hty, lty);
+    let int_equiv = hty.same_size_f2i();
+    if let Some(ie) = int_equiv { 
+        hi = b.un(Unop::Bitcast(ie), hi);
+        lo = b.un(Unop::Bitcast(ie), lo);
+        hty = ie;
+    }
     let big = hty.double_int().unwrap();
-    b.bin(Binop::Or, b.bin(Binop::Shl, b.ext(Unsigned, big, hi), b.const_int(I32, 32)),
-                     b.ext(Unsigned, big, lo))
-
+    let mut ret = b.bin(Binop::Or,
+                        b.bin(Binop::Shl, b.ext(Unsigned, big, hi), b.const_int(I32, 32)),
+                        b.ext(Unsigned, big, lo));
+    if let Some(_) = int_equiv {
+        ret = b.un(Unop::Bitcast(big.same_size_i2f().unwrap()), ret);
+    }
+    ret
 }
 
 fn make_unex<B: Builder>(b: B, op: u32, x: B::Ref) -> B::Ref {
@@ -304,8 +357,8 @@ fn make_unex<B: Builder>(b: B, op: u32, x: B::Ref) -> B::Ref {
         Iop_64to32 => b.trunc(I32, x),
         Iop_128to64 => b.trunc(I64, x),
 
-        Iop_32HIto16 => b.trunc(I16,  b.bin(Binop::Shr, x, b.const_int(I32, 16))),
-        Iop_64HIto32 => b.trunc(I32,  b.bin(Binop::Shr, x, b.const_int(I32, 32))),
+        Iop_32HIto16 =>  b.trunc(I16,  b.bin(Binop::Shr, x, b.const_int(I32, 16))),
+        Iop_64HIto32 =>  b.trunc(I32,  b.bin(Binop::Shr, x, b.const_int(I32, 32))),
         Iop_128HIto64 => b.trunc(I64, b.bin(Binop::Shr, x, b.const_int(I32, 64))),
         Iop_32to1 | Iop_64to1 => b.trunc(I1, x),
 
@@ -318,6 +371,11 @@ fn make_unex<B: Builder>(b: B, op: u32, x: B::Ref) -> B::Ref {
         Iop_1Sto16 => b.ext(Signed, I16, x),
         Iop_1Sto32 => b.ext(Signed, I32, x),
         Iop_1Sto64 => b.ext(Signed, I64, x),
+
+        Iop_F128HItoF64 => b.un(Unop::Bitcast(F64),
+                                b.trunc(I64, b.bin(Binop::Shr, b.un(Unop::Bitcast(I128), x),
+                                                               b.const_int(I32, 64)))),
+        Iop_F128LOtoF64 => b.un(Unop::Bitcast(F64), b.trunc(I64, b.un(Unop::Bitcast(I128), x))),
 
         _ => b.un(translate_unop(op), x),
     }
@@ -332,6 +390,8 @@ fn make_binex<B: Builder>(b: &B, op: u32, l: B::Ref, r: B::Ref) -> B::Ref {
                     b.const_int(ty, 4),
                     b.const_int(ty, 2)))
     };
+    if let Some(runop) = translate_runop(op) { return b.run(runop, l, r); }
+
     match op {
         Iop_CmpORD32U | Iop_CmpORD64U => cmp_ord(l, r, Unsigned),
         Iop_CmpORD32S | Iop_CmpORD64S => cmp_ord(l, r, Signed),
@@ -352,12 +412,26 @@ fn make_binex<B: Builder>(b: &B, op: u32, l: B::Ref, r: B::Ref) -> B::Ref {
             pair(b, b.bin(Binop::Mod(s), l.clone(), r.clone()),
                     b.bin(Binop::Div(s), l.clone(), r.clone()))
         },
-        Iop_16HLto32 | Iop_32HLto64 | Iop_64HLto128 => pair(b, l, r),
+        Iop_16HLto32 | Iop_32HLto64 | Iop_64HLto128 | Iop_F64HLtoF128 => pair(b, l, r),
 
-        Iop_SqrtF64 | Iop_SqrtF32 => b.run(RoundedUnop::FSqrt, l, r),
 
         _ => b.bin(translate_binop(op), l, r),
     }
+}
+
+
+fn translate_runop(x: u32) -> Option<RoundedUnop> {
+    Some(match x {
+        Iop_SqrtF128 | Iop_SqrtF64 | Iop_SqrtF32 => RoundedUnop::FSqrt,
+        Iop_F64toI16S => RoundedUnop::FToI(Signed, I16),
+        Iop_F64toI32S | Iop_F32toI32S => RoundedUnop::FToI(Signed, I32),
+        Iop_F64toI64S | Iop_F32toI64S => RoundedUnop::FToI(Signed, I64),
+        Iop_F64toI32U | Iop_F32toI32U => RoundedUnop::FToI(Unsigned, I32),
+        Iop_F64toI64U | Iop_F32toI64U => RoundedUnop::FToI(Unsigned, I64),
+        Iop_I32StoF32 | Iop_I64StoF32 => RoundedUnop::IToF(Signed, F32),
+        Iop_F64toF32 => RoundedUnop::F64to32,
+        _ => return None,
+    })
 }
 
 fn translate_binop(x: u32) -> Binop {
@@ -391,6 +465,8 @@ fn translate_binop(x: u32) -> Binop {
         Iop_DivU32 | Iop_DivU64 => Binop::Div(Unsigned),
         Iop_DivS32 | Iop_DivS64 => Binop::Div(Signed),
 
+        Iop_CmpF32 | Iop_CmpF64 | Iop_CmpF128 => Binop::FCmp,
+
         _ => panic!("unexpected binop {}", x),
     }
 }
@@ -400,8 +476,13 @@ fn translate_unop(x: u32) -> Unop {
         Iop_Not1 | Iop_Not8 | Iop_Not16 | Iop_Not32 | Iop_Not64 => Unop::Not,
         Iop_Clz64 | Iop_Clz32 => Unop::Clz,
         Iop_Ctz64 | Iop_Ctz32 => Unop::Ctz,
-        Iop_NegF64 | Iop_NegF32 => Unop::FNeg,
-        Iop_AbsF64 | Iop_AbsF32 => Unop::FAbs,
+        Iop_NegF128 | Iop_NegF64 | Iop_NegF32 => Unop::FNeg,
+        Iop_AbsF128 | Iop_AbsF64 | Iop_AbsF32 => Unop::FAbs,
+        Iop_F32toF64 => Unop::F32to64,
+        Iop_ReinterpF64asI64 => Unop::Bitcast(I64),
+        Iop_ReinterpI64asF64 => Unop::Bitcast(F64),
+        Iop_ReinterpF32asI32 => Unop::Bitcast(I32),
+        Iop_ReinterpI32asF32 => Unop::Bitcast(F32),
 
         _ => panic!("unexpected unop {}", x),
     }
@@ -426,10 +507,10 @@ fn make_triex<B: Builder>(b: &B, op: u32, x: B::Ref, y: B::Ref, z: B::Ref) -> B:
 
 fn translate_rbinop(x: u32) -> RoundedBinop {
     match x {
-        Iop_AddF64 | Iop_AddF32 => RoundedBinop::FAdd,
-        Iop_SubF64 | Iop_SubF32 => RoundedBinop::FSub,
-        Iop_MulF64 | Iop_MulF32 => RoundedBinop::FMul,
-        Iop_DivF64 | Iop_DivF32 => RoundedBinop::FDiv,
+        Iop_AddF128 | Iop_AddF64 | Iop_AddF32 => RoundedBinop::FAdd,
+        Iop_SubF128 | Iop_SubF64 | Iop_SubF32 => RoundedBinop::FSub,
+        Iop_MulF128 | Iop_MulF64 | Iop_MulF32 => RoundedBinop::FMul,
+        Iop_DivF128 | Iop_DivF64 | Iop_DivF32 => RoundedBinop::FDiv,
         _ => panic!("unexpected triop {}", x),
     }
 }
