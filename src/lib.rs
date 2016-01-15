@@ -63,7 +63,7 @@ pub enum Unop {
     Neg,
     Clz,
     Ctz,
-    F32to64,
+    FUpcast(Ty),
     FNeg,
     FAbs,
     Bitcast(Ty),
@@ -72,7 +72,7 @@ pub enum Unop {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum RoundedUnop {
-    F64to32,
+    FDowncast(Ty),
     FSqrt,
     FToI(Signedness, Ty),
     IToF(Signedness, Ty),
@@ -203,7 +203,10 @@ fn guess_type<B: Builder>(b: &B, ex: Expr<B::Ref>) -> Ty {
             let ty = arg.ty;
             match op {
                 Unop::Clz | Unop::Ctz => I32,
-                Unop::F32to64 => F64,
+                Unop::FUpcast(uty) => {
+                    assert!(ty != uty);
+                    uty
+                },
                 _ => ty
             }
         },
@@ -213,7 +216,10 @@ fn guess_type<B: Builder>(b: &B, ex: Expr<B::Ref>) -> Ty {
             assert_eq!(rm.ty, I32); // rounding mode
             let ty = arg.ty;
             match op {
-                RoundedUnop::F64to32 => { assert_eq!(ty, F64); F32 },
+                RoundedUnop::FDowncast(lty) => {
+                    assert!(lty != ty);
+                    lty
+                },
                 RoundedUnop::FSqrt => ty,
                 RoundedUnop::FToI(_, toty) => {
                     assert!(toty.is_int());
@@ -282,12 +288,24 @@ trait Builder {
         self.build(Expr::Bin(op, left, right))
     }
     fn un(&self, op: Unop, arg: Self::Ref) -> Self::Ref {
+        match op {
+            Unop::FUpcast(ty) => {
+                if ty == self.get(&arg).ty { return arg; }
+            }
+            _ => ()
+        }
         self.build(Expr::Un(op, arg))
     }
     fn rbin(&self, op: RoundedBinop, rm: Self::Ref, l: Self::Ref, r: Self::Ref) -> Self::Ref {
         self.build(Expr::RoundedBin(op, rm, l, r))
     }
     fn run(&self, op: RoundedUnop, rm: Self::Ref, x: Self::Ref) -> Self::Ref {
+        match op {
+            RoundedUnop::FDowncast(ty) => {
+                if ty == self.get(&x).ty { return x; }
+            }
+            _ => ()
+        }
         self.build(Expr::RoundedUn(op, rm, x))
     }
     /*
@@ -424,12 +442,16 @@ fn translate_runop(x: u32) -> Option<RoundedUnop> {
     Some(match x {
         Iop_SqrtF128 | Iop_SqrtF64 | Iop_SqrtF32 => RoundedUnop::FSqrt,
         Iop_F64toI16S => RoundedUnop::FToI(Signed, I16),
-        Iop_F64toI32S | Iop_F32toI32S => RoundedUnop::FToI(Signed, I32),
-        Iop_F64toI64S | Iop_F32toI64S => RoundedUnop::FToI(Signed, I64),
-        Iop_F64toI32U | Iop_F32toI32U => RoundedUnop::FToI(Unsigned, I32),
-        Iop_F64toI64U | Iop_F32toI64U => RoundedUnop::FToI(Unsigned, I64),
-        Iop_I32StoF32 | Iop_I64StoF32 => RoundedUnop::IToF(Signed, F32),
-        Iop_F64toF32 => RoundedUnop::F64to32,
+        Iop_F128toI32S | Iop_F64toI32S | Iop_F32toI32S => RoundedUnop::FToI(Signed, I32),
+        Iop_F128toI64S | Iop_F64toI64S | Iop_F32toI64S => RoundedUnop::FToI(Signed, I64),
+        Iop_F128toI32U | Iop_F64toI32U | Iop_F32toI32U => RoundedUnop::FToI(Unsigned, I32),
+        Iop_F128toI64U | Iop_F64toI64U | Iop_F32toI64U => RoundedUnop::FToI(Unsigned, I64),
+
+        Iop_I32StoF32 | Iop_I64StoF32 =>   RoundedUnop::IToF(Signed, F32),
+        Iop_I32StoF128 | Iop_I64StoF128 => RoundedUnop::IToF(Signed, F128),
+        Iop_I32UtoF128 | Iop_I64UtoF128 => RoundedUnop::IToF(Unsigned, F128),
+        Iop_F128toF32 | Iop_F64toF32 => RoundedUnop::FDowncast(F32),
+        Iop_F128toF64 => RoundedUnop::FDowncast(F64),
         _ => return None,
     })
 }
@@ -478,7 +500,7 @@ fn translate_unop(x: u32) -> Unop {
         Iop_Ctz64 | Iop_Ctz32 => Unop::Ctz,
         Iop_NegF128 | Iop_NegF64 | Iop_NegF32 => Unop::FNeg,
         Iop_AbsF128 | Iop_AbsF64 | Iop_AbsF32 => Unop::FAbs,
-        Iop_F32toF64 => Unop::F32to64,
+        Iop_F32toF64 => Unop::FUpcast(F64),
         Iop_ReinterpF64asI64 => Unop::Bitcast(I64),
         Iop_ReinterpI64asF64 => Unop::Bitcast(F64),
         Iop_ReinterpF32asI32 => Unop::Bitcast(I32),
@@ -490,9 +512,10 @@ fn translate_unop(x: u32) -> Unop {
 
 fn make_triex<B: Builder>(b: &B, op: u32, x: B::Ref, y: B::Ref, z: B::Ref) -> B::Ref {
     let roundabout = |bop: RoundedBinop, rm: B::Ref, l: B::Ref, r: B::Ref| {
-        b.un(Unop::F32to64, b.rbin(bop, rm.clone(),
-                                   b.run(RoundedUnop::F64to32, rm.clone(), l),
-                                   b.run(RoundedUnop::F64to32, rm.clone(), r)))
+        b.un(Unop::FUpcast(F64),
+             b.rbin(bop, rm.clone(),
+                    b.run(RoundedUnop::FDowncast(F32), rm.clone(), l),
+                    b.run(RoundedUnop::FDowncast(F32), rm.clone(), r)))
 
     };
     match op {
